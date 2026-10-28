@@ -875,14 +875,6 @@ export function renderSkillContent(skill) {
 }
 
 /** A user-role injection message shaped like dsh-llm createUserMessage. */
-function createSkillInjectionMessage(name, text) {
-  return Object.freeze({
-    id: randomUUID(),
-    role: 'user',
-    content: Object.freeze([Object.freeze({ type: 'text', text })]),
-    source: Object.freeze({ kind: 'skill-invocation', name, form: 'instructions' })
-  });
-}
 
 /** Whether one claimed message is a genuine human prompt (not injected context). */
 function isHumanMessage(message) {
@@ -921,63 +913,115 @@ async function skillLookupOptions(ctx, agent, signal) {
 }
 
 /**
- * Build the injection messages for one step. Every failure path yields an empty
- * list: an unusable skill registry must never block or crash a conversation.
+ * Insert one section right after the harness identity section.
+ * Assembly sections carry no `order` field, so the array index is the only lever:
+ * appending puts the skill rules last, where a fast model ignores them.
  */
-async function buildSkillInjections(ctx, homeDir, agent, signal, already) {
-  const config = readAutoSkillsConfig(homeDir);
-  if (config.skills.length === 0) return [];
-  const skills = getService(ctx, 'skills');
-  if (!skills || typeof skills.get !== 'function') return [];
-  const options = await skillLookupOptions(ctx, agent, signal);
-  const injections = [];
-  for (const name of config.skills) {
-    if (already.includes(name)) continue;
-    try {
-      const skill = await skills.get(name, options);
-      if (!skill || typeof skill !== 'object') continue;
-      const invocation = skill.invocation && typeof skill.invocation === 'object' ? skill.invocation : null;
-      if (invocation && invocation.userInvocable === false) continue;
-      injections.push(createSkillInjectionMessage(name, renderSkillContent(skill)));
-    } catch (_) {
-      // One broken skill never drops the rest, and never aborts the turn.
-    }
-  }
-  return injections;
+function insertAfterIdentity(sections, section) {
+  const index = sections.findIndex((entry) => entry && entry.name === 'harness:identity');
+  if (index < 0) return [...sections, section];
+  return [...sections.slice(0, index + 1), section, ...sections.slice(index + 1)];
+}
+
+/** The single prompt section every auto-attached skill lands in. */
+const AUTO_SKILL_SECTION_NAME = 'dsh-self-use:auto-skills';
+
+/** Whether one assembly section is ours, so a later step can replace it. */
+function isSkillSection(section) {
+  return Boolean(section) && typeof section === 'object' && section.name === AUTO_SKILL_SECTION_NAME;
 }
 
 /**
- * Register the agent/pre-step hook that auto-attaches every selected skill.
- * Injection happens only on a step that claims real human input, which is
- * exactly "the user just sent a message" — continuation steps and goal wakes
- * are left untouched, so the context never grows on its own.
+ * Build the skill bodies for one step, as text blocks ready for the system prompt.
+ * Every failure path yields an empty list: an unusable skill registry must never
+ * block or crash a conversation.
+ */
+/** Write one diagnostic line, so a silent failure in the Host is visible. */
+function traceDiag(homeDir, trace) {
+  try {
+    const paths = autoSkillsPaths(homeDir);
+    fs.mkdirSync(paths.dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(paths.dir, 'auto-skill-trace.log'),
+      new Date().toISOString() + ' ' + JSON.stringify(trace.diag) + String.fromCharCode(10),
+      'utf8'
+    );
+  } catch (_) {}
+}
+
+async function buildSkillBlocks(ctx, homeDir, agent, signal) {
+  const diag = { step: 'start' };
+  const config = readAutoSkillsConfig(homeDir);
+  diag.configured = config.skills;
+  if (config.skills.length === 0) return { blocks: [], diag };
+  const skills = getService(ctx, 'skills');
+  diag.hasSkills = Boolean(skills) && typeof skills.get === 'function';
+  if (!diag.hasSkills) return { blocks: [], diag };
+  const options = await skillLookupOptions(ctx, agent, signal);
+  diag.hasAgent = Boolean(agent);
+  const blocks = [];
+  const errors = [];
+  for (const name of config.skills) {
+    try {
+      const skill = await skills.get(name, options);
+      if (!skill || typeof skill !== 'object') { errors.push(name + ':missing'); continue; }
+      const invocation = skill.invocation && typeof skill.invocation === 'object' ? skill.invocation : null;
+      if (invocation && invocation.userInvocable === false) { errors.push(name + ':notInvocable'); continue; }
+      blocks.push(renderSkillContent(skill));
+    } catch (error) {
+      errors.push(name + ':' + (error && error.message ? error.message : 'threw'));
+    }
+  }
+  diag.errors = errors;
+  diag.blocks = blocks.length;
+  return { blocks, diag };
+}
+
+/**
+ * Register the system-prompt hook that auto-attaches every selected skill.
+ *
+ * This MUST hang off `system-prompt/assemble`, not `agent/pre-step`: the agent
+ * loop returns `{ ...decision, assembly }`, spreading the freshly assembled
+ * value over anything a pre-step listener put there, so a pre-step edit is
+ * silently discarded. The assemble waterfall runs inside assemble() itself and
+ * its return value is the one actually rendered.
  */
 export function installAutoSkillInjection(ctx, options = {}) {
   if (!ctx || typeof ctx.on !== 'function') return () => {};
   const homeDir = typeof options.homeDir === 'string' && options.homeDir ? options.homeDir : undefined;
 
-  const listener = async (payload, next) => {
-    const decision = await next();
+  const listener = async (assembly, context, next) => {
+    const base = await next();
     try {
-      if (!decision || decision.kind === 'reject') return decision;
-      const claimed = Array.isArray(payload?.messages) ? payload.messages : [];
-      if (!claimed.some(isHumanMessage)) return decision;
-      const messages = Array.isArray(decision.messages) ? decision.messages : [];
-      const already = injectedSkillNames(messages);
-      const injections = await buildSkillInjections(ctx, homeDir, payload?.agent, payload?.signal, already);
-      if (injections.length === 0) return decision;
-      return { ...decision, messages: [...messages, ...injections] };
+      if (!base || typeof base !== 'object' || !Array.isArray(base.sections)) return base;
+      const scope = context && typeof context === 'object' ? context : {};
+      const trace = await buildSkillBlocks(ctx, homeDir, scope.agent, scope.signal);
+      const blocks = trace.blocks;
+      if (blocks.length === 0) {
+        traceDiag(homeDir, trace);
+        return base;
+      }
+      // 同名 section 先移除再写入，避免每步累加导致 prompt 膨胀。
+      const kept = base.sections.filter((section) => !isSkillSection(section));
+      const section = { name: AUTO_SKILL_SECTION_NAME, text: blocks.join('\n\n'), interpolate: false };
+      const sections = insertAfterIdentity(kept, section);
+      const result = { ...base, sections };
+      trace.diag.returned = result.sections.length;
+      trace.diag.sectionNames = result.sections.map((section) => section.name);
+      traceDiag(homeDir, trace);
+      return result;
     } catch (_) {
-      // Any failure returns the untouched decision: never break the turn.
-      return decision;
+      // Any failure returns the untouched assembly: never break a turn.
+      return base;
     }
   };
 
-  const dispose = ctx.on('agent/pre-step', listener);
+  const dispose = ctx.on('system-prompt/assemble', listener);
   const cleanup = typeof dispose === 'function' ? dispose : () => {};
-  if (typeof ctx.effect === 'function') ctx.effect(() => cleanup, 'dsh-self-use: auto-skill injection');
+  if (typeof ctx.effect === 'function') ctx.effect(() => cleanup, 'dsh-self-use: auto-skill prompt section');
   return cleanup;
 }
+
 // #endregion
 
 // #region auto-cleanup — persisted config, background sweep, one-shot tick

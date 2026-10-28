@@ -643,7 +643,12 @@ window.__ModuleLoader__.load({
     /** 当前浏览目录。空字符串表示尚未初始化。 */
     let fmPath = "";
     let fmTimer = null;
-    let fmLoading = false;
+    /** 已挂载的文件面板对应的会话根目录，用于识别会话切换。 */
+    let fmSessionRoot = "";
+    /** 目录 listing 缓存，切回标签时先用它同步绘制，避免闪一下根目录。 */
+    const fmCache = new Map();
+    /** 渲染序号：并发请求只有最后一次生效，避免加载中丢请求。 */
+    let fmRenderSeq = 0;
 
     function formatSize(bytes) {
       if (typeof bytes !== "number" || bytes <= 0) return "";
@@ -723,105 +728,121 @@ window.__ModuleLoader__.load({
       renderList(root);
     }
 
-    /** 渲染当前目录：上级、目录、文件，文件大小与操作按钮靠右。 */
+    /** 从一份 listing 同步构建列表 DOM，不碰网络。 */
+    function buildList(root, listing) {
+      const list = document.createElement("ul");
+      list.className = FM_CLASS.level;
+
+      const makeRow = (kind, label, fullPath, onActivate) => {
+        const li = document.createElement("li");
+        li.className = FM_CLASS.item + " dsh-self-use-fm-row";
+        li.setAttribute(FILE_ROW_ATTR, fullPath);
+        li.setAttribute(FILE_ENTRY_ATTR, kind);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = FM_CLASS.row;
+        button.title = fullPath;
+        const icon = document.createElement("span");
+        icon.className = kind === "file" ? FM_CLASS.fileIcon : FM_CLASS.icon;
+        icon.appendChild(makeFmIcon(kind === "file" ? "file" : "folder"));
+        button.appendChild(icon);
+        const name = document.createElement("span");
+        name.className = FM_CLASS.name;
+        name.textContent = label;
+        button.appendChild(name);
+        if (typeof onActivate === "function") button.addEventListener("click", onActivate);
+        li.appendChild(button);
+        return li;
+      };
+
+      if (listing.parent !== null) {
+        list.appendChild(makeRow("directory", "../", listing.parent, (event) => {
+          event.preventDefault();
+          navigateTo(root, listing.parent);
+        }));
+      }
+
+      for (let index = 0; index < listing.entries.length; index += 1) {
+        const entry = listing.entries[index];
+        if (entry.type !== "file" && entry.type !== "directory") continue;
+        const row = makeRow(entry.type, entry.name, entry.path, (event) => {
+          event.preventDefault();
+          if (entry.type === "directory") navigateTo(root, entry.path);
+          else openFilePreview(root, entry.path);
+        });
+
+        const meta = document.createElement("span");
+        meta.className = "dsh-self-use-fm-meta";
+        meta.textContent = entry.type === "file" ? formatSize(entry.size) : "";
+        row.appendChild(meta);
+
+        const bar = document.createElement("span");
+        bar.className = "dsh-self-use-fm-actions";
+        bar.appendChild(makeFmButton("copy", "复制路径", () => copyText(entry.path)));
+        if (entry.type === "file") bar.appendChild(makeFmButton("download", "下载", () => downloadEntry(entry.path)));
+        bar.appendChild(makeFmButton("trash", "删除", () => deleteEntry(entry.path, root)));
+        row.appendChild(bar);
+
+        list.appendChild(row);
+      }
+
+      return list;
+    }
+
+    /**
+     * 保证 body 里存在「隐藏的官方容器 + 自绘容器」。
+     * 官方节点必须留在 DOM 里：它绑定的 tabActions 是打开预览的唯一可靠入口。
+     */
+    function ensureWrappers(body) {
+      const existing = body.querySelector("[data-dsh-self-use-fm-mine]");
+      if (existing !== null) return existing;
+
+      const official = document.createElement("div");
+      official.setAttribute("data-dsh-self-use-fm-official", "1");
+      official.className = "dsh-self-use-fm-official";
+      const mine = document.createElement("div");
+      mine.setAttribute("data-dsh-self-use-fm-mine", "1");
+      mine.className = "dsh-self-use-fm-mine";
+
+      const preserved = [];
+      while (body.firstChild !== null && body.firstChild !== undefined) {
+        preserved.push(body.removeChild(body.firstChild));
+      }
+      for (let index = 0; index < preserved.length; index += 1) official.appendChild(preserved[index]);
+      body.appendChild(official);
+      body.appendChild(mine);
+      return mine;
+    }
+
+    /** 用缓存同步绘制，避免切回标签时先闪一下官方根目录。 */
+    function paintFromCache(root) {
+      const body = root.querySelector("[" + FILES_BODY_ATTR + "]");
+      if (body === null) return false;
+      const listing = fmCache.get(fmPath);
+      if (listing === undefined) return false;
+      ensureWrappers(body).replaceChildren(buildList(root, listing));
+      renderBreadcrumb(root, listing.path);
+      return true;
+    }
+
+    /** 拉取并渲染当前目录。并发调用只有最后一次生效。 */
     async function renderList(root) {
-      if (fmLoading === true) return;
       const body = root.querySelector("[" + FILES_BODY_ATTR + "]");
       if (body === null) return;
-      // 首次调用没有目录时，用 session cwd 初始化。
       if (fmPath === "") {
         const sessionRoot = root.getAttribute(FILES_ROOT_ATTR);
         if (typeof sessionRoot !== "string" || sessionRoot === "") return;
         fmPath = sessionRoot;
       }
-      fmLoading = true;
-      try {
-        const result = await getJson("/files?path=" + encodeURIComponent(fmPath));
-        if (result.ok !== true || result.data === null || result.data.listing === null) return;
-        const listing = result.data.listing;
-        fmPath = listing.path;
-        renderBreadcrumb(root, listing.path);
-
-        const list = document.createElement("ul");
-        list.className = FM_CLASS.level;
-
-        const makeRow = (kind, label, fullPath, onActivate) => {
-          const li = document.createElement("li");
-          li.className = FM_CLASS.item + " dsh-self-use-fm-row";
-          li.setAttribute(FILE_ROW_ATTR, fullPath);
-          li.setAttribute(FILE_ENTRY_ATTR, kind);
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = FM_CLASS.row;
-          button.title = fullPath;
-          const icon = document.createElement("span");
-          icon.className = kind === "file" ? FM_CLASS.fileIcon : FM_CLASS.icon;
-          icon.appendChild(makeFmIcon(kind === "file" ? "file" : "folder"));
-          button.appendChild(icon);
-          const name = document.createElement("span");
-          name.className = FM_CLASS.name;
-          name.textContent = label;
-          button.appendChild(name);
-          if (typeof onActivate === "function") button.addEventListener("click", onActivate);
-          li.appendChild(button);
-          return li;
-        };
-
-        if (listing.parent !== null) {
-          list.appendChild(makeRow("directory", "../", listing.parent, (event) => {
-            event.preventDefault();
-            navigateTo(root, listing.parent);
-          }));
-        }
-
-        for (let index = 0; index < listing.entries.length; index += 1) {
-          const entry = listing.entries[index];
-          if (entry.type !== "file" && entry.type !== "directory") continue;
-          const row = makeRow(entry.type, entry.name, entry.path, (event) => {
-            event.preventDefault();
-            if (entry.type === "directory") navigateTo(root, entry.path);
-            else openFilePreview(root, entry.path);
-          });
-
-          const meta = document.createElement("span");
-          meta.className = "dsh-self-use-fm-meta";
-          meta.textContent = entry.type === "file" ? formatSize(entry.size) : "";
-          row.appendChild(meta);
-
-          const bar = document.createElement("span");
-          bar.className = "dsh-self-use-fm-actions";
-          bar.appendChild(makeFmButton("copy", "复制路径", () => copyText(entry.path)));
-          if (entry.type === "file") bar.appendChild(makeFmButton("download", "下载", () => downloadEntry(entry.path)));
-          bar.appendChild(makeFmButton("trash", "删除", () => deleteEntry(entry.path, root)));
-          row.appendChild(bar);
-
-          list.appendChild(row);
-        }
-
-        // 官方列表保留在 DOM 里（隐藏），用于借用它的点击处理器打开预览。
-        let official = body.querySelector("[data-dsh-self-use-fm-official]");
-        if (official === null) {
-          official = document.createElement("div");
-          official.setAttribute("data-dsh-self-use-fm-official", "1");
-          official.className = "dsh-self-use-fm-official";
-          const preserved = [];
-          while (body.firstChild !== null && body.firstChild !== undefined) {
-            preserved.push(body.removeChild(body.firstChild));
-          }
-          for (let i = 0; i < preserved.length; i += 1) official.appendChild(preserved[i]);
-          body.appendChild(official);
-        }
-        let mine = body.querySelector("[data-dsh-self-use-fm-mine]");
-        if (mine === null) {
-          mine = document.createElement("div");
-          mine.setAttribute("data-dsh-self-use-fm-mine", "1");
-          mine.className = "dsh-self-use-fm-mine";
-          body.appendChild(mine);
-        }
-        mine.replaceChildren(list);
-      } finally {
-        fmLoading = false;
-      }
+      const seq = ++fmRenderSeq;
+      const result = await getJson("/files?path=" + encodeURIComponent(fmPath));
+      if (seq !== fmRenderSeq) return;
+      if (result.ok !== true || result.data === null || result.data.listing === null) return;
+      const listing = result.data.listing;
+      fmPath = listing.path;
+      fmCache.set(listing.path, listing);
+      ensureWrappers(body).replaceChildren(buildList(root, listing));
+      renderBreadcrumb(root, listing.path);
     }
 
     function startFmAutoRefresh(root) {
@@ -841,14 +862,248 @@ window.__ModuleLoader__.load({
       if (fileManagerEnabled() !== true) return;
       const root = filesRootElement();
       if (root === null) return;
-      if (root.getAttribute("data-dsh-self-use-fm") === "1") return;
       const sessionRoot = root.getAttribute(FILES_ROOT_ATTR);
       if (typeof sessionRoot !== "string" || sessionRoot === "") return;
-      root.setAttribute("data-dsh-self-use-fm", "1");
-      fmPath = sessionRoot;
+
+      // 换了会话：回到新会话的根目录。
+      if (fmSessionRoot !== sessionRoot) {
+        fmSessionRoot = sessionRoot;
+        fmPath = sessionRoot;
+        fmCache.clear();
+      }
+      if (fmPath === "") fmPath = sessionRoot;
+
+      const body = root.querySelector("[" + FILES_BODY_ATTR + "]");
+      if (body === null) return;
+      // 官方 React 重新渲染会连容器一起抹掉。容器还在且有内容就不重绘，
+      // 否则重建容器并停在 fmPath 指向的目录，而不是退回根目录。
+      const mine = body.querySelector("[data-dsh-self-use-fm-mine]");
+      if (mine !== null && mine.childElementCount > 0) return;
+
+      root.setAttribute(FM_ACTION_ATTR, "1");
+      paintFromCache(root);
       renderList(root);
       startFmAutoRefresh(root);
     }
+
+    // #region dsh-self-use: prompt history recall (arrow keys)
+    /** 每个会话的回填状态：光标位置、草稿、当前列表。 */
+    const historyState = new Map();
+    let historyBound = false;
+    let historyBindingInput = null;
+
+    function historySessionKey() {
+      try {
+        return currentSessionId() || "anon";
+      } catch (_) {
+        return "anon";
+      }
+    }
+
+    /** 取当前会话的用户提问，最新的排在前面。 */
+    async function historyPrompts() {
+      const sessionId = currentSessionId();
+      if (sessionId === "") return [];
+      const result = await getJson("/prompts?sessionId=" + encodeURIComponent(sessionId));
+      if (result.ok !== true || result.data === null || result.data.ok === false) return [];
+      const list = Array.isArray(result.data.prompts) ? result.data.prompts : [];
+      const texts = [];
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const text = list[i] && typeof list[i].text === "string" ? list[i].text.trim() : "";
+        if (text !== "") texts.push(text);
+      }
+      return texts;
+    }
+
+    function setInputValue(input, value) {
+      const proto = Object.getPrototypeOf(input);
+      const setter = proto === null || proto === undefined ? undefined : Object.getOwnPropertyDescriptor(proto, "value");
+      if (setter && typeof setter.set === "function") setter.set.call(input, value);
+      else input.value = value;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    /** 同步判断这次按键会不会被接管，供 preventDefault 用。 */
+    function canStepHistory(direction) {
+      const state = historyState.get(historySessionKey());
+      if (state === undefined || state.list === null) return true;
+      if (state.list.length === 0) return false;
+      if (direction < 0) return state.index + 1 < state.list.length;
+      if (state.index === -1 || state.atDraft === true) return false;
+      return true;
+    }
+
+    async function stepHistory(input, direction) {
+      const key = historySessionKey();
+      let state = historyState.get(key);
+      if (state === undefined) {
+        state = { list: null, index: -1, draft: "", atDraft: false };
+        historyState.set(key, state);
+      }
+      if (state.list === null) {
+        state.list = await historyPrompts();
+        if (state.list.length === 0) return false;
+      }
+      const list = state.list;
+      if (direction < 0) {
+        if (state.index === -1) {
+          state.draft = input.value;
+          state.index = 0;
+        } else if (state.index + 1 < list.length) {
+          state.index += 1;
+        } else {
+          return false;
+        }
+        state.atDraft = false;
+        setInputValue(input, list[state.index]);
+        return true;
+      }
+      // 已经回到草稿，下箭头交还给输入框本身。
+      if (state.index === -1 || state.atDraft === true) return false;
+      // list 是「最新在前」：index 0 是最新，index 越大越老。
+      // 下箭头往更新走，index 减 1；已经在 0（最新）时再按才回草稿。
+      if (state.index > 0) {
+        state.index -= 1;
+        setInputValue(input, list[state.index]);
+        return true;
+      }
+      state.index = -1;
+      state.atDraft = true;
+      setInputValue(input, state.draft);
+      return true;
+    }
+
+    function onHistoryKeyDown(event) {
+      if (readPrefs().stickyPrompt !== true) return;
+      if (event === null || typeof event !== "object") return;
+      if (event.isComposing === true || event.keyCode === 229) return;
+      const up = event.key === "ArrowUp";
+      const down = event.key === "ArrowDown";
+      if (up !== true && down !== true) return;
+      if (event.altKey === true || event.ctrlKey === true || event.metaKey === true || event.shiftKey === true) return;
+      const input = event.target;
+      if (input === null || typeof input !== "object") return;
+      if (typeof input.tagName !== "string" || input.tagName.toUpperCase() !== "TEXTAREA") return;
+      const value = typeof input.value === "string" ? input.value : "";
+      const atStart = input.selectionStart === 0 && input.selectionEnd === 0;
+      const atEnd = input.selectionStart === value.length && input.selectionEnd === value.length;
+      const empty = value.trim() === "";
+      // 只在光标贴边时接管，否则保留多行编辑。
+      if (up === true && !empty && !atStart) return;
+      if (down === true && !atEnd) return;
+      // 必须先同步 preventDefault：异步里调用浏览器已经不认了。
+      // 列表未加载时无法预判，先接管再让 stepHistory 自己失败。
+      if (canStepHistory(up === true ? -1 : 1) !== true) return;
+      event.preventDefault();
+      stepHistory(input, up === true ? -1 : 1).catch(() => {});
+    }
+
+    /** 文档级捕获，避免输入框被 React 重挂后丢监听。 */
+    function installPromptHistory() {
+      if (historyBound === true) return () => {};
+      historyBound = true;
+      document.addEventListener("keydown", onHistoryKeyDown, true);
+      return () => {
+        historyBound = false;
+        document.removeEventListener("keydown", onHistoryKeyDown, true);
+      };
+    }
+    // #endregion
+
+    // #region dsh-self-use: workspace busy folder icon
+    /** 会话行：官方在运行中会放一个 data-state=ongoing 的 svg。 */
+    const SESSION_ROW_SEL = '[data-row-key^="session:"]';
+    const WORKSPACE_ROW_SEL = '[data-row-key^="workspace:"]';
+    const BUSY_ICON_ATTR = "data-dsh-self-use-busy";
+
+    /** 一个工作区下是否有会话正在跑。 */
+    function workspaceIsBusy(workspaceRow) {
+      const section = workspaceRow.closest(".bhn1Oq_groupSection") || workspaceRow.parentElement;
+      if (section === null || section === undefined) return false;
+      const sessions = section.querySelectorAll(SESSION_ROW_SEL);
+      for (let i = 0; i < sessions.length; i += 1) {
+        if (sessions[i].querySelector('svg[data-state="ongoing"]') !== null) return true;
+      }
+      return false;
+    }
+
+    /** 复刻官方 spinner 的结构与 class，动画由官方 CSS 驱动。 */
+    function makeBusySpinner() {
+      const NS = "http://www.w3.org/2000/svg";
+      const spinner = document.createElementNS(NS, "svg");
+      spinner.setAttribute(BUSY_ICON_ATTR, "1");
+      spinner.setAttribute("width", "16");
+      spinner.setAttribute("height", "16");
+      spinner.setAttribute("viewBox", "0 0 24 24");
+      spinner.setAttribute("aria-hidden", "true");
+      const g = document.createElementNS(NS, "g");
+      g.setAttribute("class", "_spinnerMotion_1i3xo_42");
+      const track = document.createElementNS(NS, "circle");
+      track.setAttribute("class", "_spinnerTrack_1i3xo_47");
+      track.setAttribute("cx", "12");
+      track.setAttribute("cy", "12");
+      track.setAttribute("r", "9.5");
+      const arc = document.createElementNS(NS, "circle");
+      arc.setAttribute("class", "_spinnerArc_1i3xo_48");
+      arc.setAttribute("cx", "12");
+      arc.setAttribute("cy", "12");
+      arc.setAttribute("r", "9.5");
+      g.appendChild(track);
+      g.appendChild(arc);
+      spinner.appendChild(g);
+      return spinner;
+    }
+
+    /** 把工作区的文件夹图标换成转圈，或换回来。 */
+    function syncWorkspaceFolderIcon(workspaceRow) {
+      const folder = workspaceRow.querySelector(".YDXeBa_folder");
+      if (folder === null) return;
+      const busy = workspaceIsBusy(workspaceRow);
+      const existing = folder.querySelector("svg[" + BUSY_ICON_ATTR + "]");
+      const folderSvg = folder.querySelector("svg:not([" + BUSY_ICON_ATTR + "])");
+      if (busy === true) {
+        if (existing !== null) return;
+        if (folderSvg !== null) folderSvg.style.display = "none";
+        folder.appendChild(makeBusySpinner());
+        return;
+      }
+      if (existing !== null) existing.remove();
+      if (folderSvg !== null && folderSvg.style.display === "none") folderSvg.style.display = "";
+    }
+
+    function syncAllWorkspaceIcons() {
+      const rows = document.querySelectorAll(WORKSPACE_ROW_SEL);
+      for (let i = 0; i < rows.length; i += 1) syncWorkspaceFolderIcon(rows[i]);
+    }
+
+    function installWorkspaceBusyIcons() {
+      let scheduled = false;
+      const run = () => {
+        scheduled = false;
+        try {
+          syncAllWorkspaceIcons();
+        } catch (_) {}
+      };
+      const schedule = () => {
+        if (scheduled === true) return;
+        scheduled = true;
+        window.setTimeout(run, 120);
+      };
+      const observer = new MutationObserver(schedule);
+      try {
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["data-state", "aria-expanded"]
+        });
+      } catch (_) {}
+      schedule();
+      return () => {
+        observer.disconnect();
+      };
+    }
+    // #endregion
 
     // #region dsh-self-use: document preview toolbar actions
     /** 预览工具栏槽位：刷新图标右边补复制 / 下载 / 删除。 */
@@ -1477,6 +1732,7 @@ window.__ModuleLoader__.load({
       ".dsh-self-use-preview-actions .dsh-self-use-fm-btn { width: 22px; height: 22px; opacity: 0.7; }",
       ".dsh-self-use-preview-actions .dsh-self-use-fm-btn:hover { opacity: 1; }",
       ".dsh-self-use-fm-official { display: none !important; }",
+      "[data-dsh-self-use-fm=\"1\"] [data-files-body] > ul { display: none !important; }",
       ".dsh-self-use-fm-mine { display: block; }",
       ".dsh-self-use-fm-actions { display: inline-flex; align-items: center; gap: 0; margin-left: 8px; flex: 0 0 auto; }",
       ".dsh-self-use-fm-btn { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: none; border-radius: 3px; background: transparent; color: var(--dsw-alias-label-tertiary, #71717a); cursor: pointer; flex: none; line-height: 0; opacity: 0.65; }",
@@ -1893,7 +2149,7 @@ window.__ModuleLoader__.load({
             persist: persist
           }),
           React.createElement(QuestionWaitSection, {}),
-          React.createElement(ModelCustomSection, {}),
+          React.createElement(ModelCustomSection, { ctx: api.ctx || pluginContext }),
           React.createElement(FileManagerSection, {
             readPrefs: () => (typeof api.readPrefs === "function" ? api.readPrefs() : readPrefs()),
             persist: persist
@@ -2221,13 +2477,32 @@ window.__ModuleLoader__.load({
 
     let modelCustomState = readModelCustomCache();
     // 最近一次见到的完整模型目录（未过滤），供设置页列出可配置强度的模型。
-    let knownModelGroups = [];
+    const KNOWN_MODELS_CACHE_KEY = "dsh-self-use:known-models.v1";
+    function readKnownModelsCache() {
+      try {
+        const raw = window.localStorage.getItem(KNOWN_MODELS_CACHE_KEY);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (_) {
+        return [];
+      }
+    }
+    function writeKnownModelsCache(groups) {
+      try {
+        if (Array.isArray(groups) && groups.length > 0) {
+          window.localStorage.setItem(KNOWN_MODELS_CACHE_KEY, JSON.stringify(groups));
+        }
+      } catch (_) {}
+    }
+    let knownModelGroups = readKnownModelsCache();
     // ctx.remote.session 尚未就绪时保留的重试入口。
     let pendingCatalogWrap = null;
 
     function rememberModelGroups(groups) {
       if (!Array.isArray(groups) || groups.length === 0) return;
       knownModelGroups = groups;
+      writeKnownModelsCache(groups);
       try {
         window.dispatchEvent(new CustomEvent("dsh:self-use:model-catalog"));
       } catch (_) {}
@@ -2341,6 +2616,22 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /** 主动拉一次模型目录，供设置页列出可配置强度的模型。 */
+    async function ensureModelCatalog(ctx) {
+      const targetCtx = ctx || pluginContext || fmContext;
+      try {
+        const remote = targetCtx && targetCtx.remote ? targetCtx.remote.session : undefined;
+        if (!remote || typeof remote.modelCatalog !== "function") return knownModelGroups;
+        const result = await remote.modelCatalog();
+        if (result && result.ok && result.value && Array.isArray(result.value.groups)) {
+          rememberModelGroups(result.value.groups);
+        }
+      } catch (error) {
+        warn("读取模型目录失败", error);
+      }
+      return knownModelGroups;
+    }
+
     /**
      * 包装 remote.session.modelCatalog：记住完整目录，再按隐藏/强度改写返回值。
      * 叠加在 model-manager 的包装之上，两者互不影响。
@@ -2445,6 +2736,7 @@ window.__ModuleLoader__.load({
 
         const load = async () => {
           await syncModelCustomFromHost();
+          await ensureModelCatalog(api.ctx || pluginContext || fmContext);
           if (alive.current !== true) return;
           setState((prev) =>
             Object.assign({}, prev, {
@@ -3925,9 +4217,11 @@ window.__ModuleLoader__.load({
     // cordis 的 inject 是点号路径精确声明：只写 "remote" 无法访问 remote.settings / remote.skills，
     // 访问会抛 cannot get property "remote.skills" without inject。官方 ui-skill / ui-reference
     // 同样显式声明 remote.skills、remote.fileReferences 等子命名空间。
-    const inject = ["slots", "sessions", "remote", "remote.settings", "remote.skills", "inputTriggers"];
+    let pluginContext = null;
+    const inject = ["slots", "sessions", "remote", "remote.session", "remote.settings", "remote.skills", "inputTriggers"];
 
     function apply(ctx) {
+      pluginContext = ctx;
       ctx.effect(() => {
         let tag = document.querySelector("style[data-plugin-css='" + STYLE_ID + "']");
         if (tag === null) {
@@ -3978,6 +4272,8 @@ window.__ModuleLoader__.load({
       ctx.effect(() => installImageRescue(), "dsh-self-use: image rescue");
 
       ctx.effect(() => mountStickyPrompt(), "dsh-self-use: sticky prompt");
+      ctx.effect(() => installPromptHistory(), "dsh-self-use: prompt history");
+      ctx.effect(() => installWorkspaceBusyIcons(), "dsh-self-use: workspace busy icons");
       ctx.effect(() => installQuestionActivityWatch(), "dsh-self-use: question activity watch");
       ctx.effect(() => installModelEyeButtons(), "dsh-self-use: model eye buttons");
       wrapModelCatalogForCustom(ctx);
@@ -4590,6 +4886,11 @@ window.__ModuleLoader__.load({
     exports.retargetDefault = retargetDefault;
     exports.modelCustomKey = modelCustomKey;
     exports.createModelCustomSection = createModelCustomSection;
+    exports.installPromptHistory = installPromptHistory;
+    exports.installWorkspaceBusyIcons = installWorkspaceBusyIcons;
+    exports.syncAllWorkspaceIcons = syncAllWorkspaceIcons;
+    exports.stepHistory = stepHistory;
+    exports.ensureModelCatalog = ensureModelCatalog;
     exports.decodeMentionSessionId = decodeMentionSessionId;
     exports.isSubagentCandidate = isSubagentCandidate;
     exports.filterSubagentCandidates = filterSubagentCandidates;
