@@ -1016,15 +1016,99 @@ window.__ModuleLoader__.load({
     const WORKSPACE_ROW_SEL = '[data-row-key^="workspace:"]';
     const BUSY_ICON_ATTR = "data-dsh-self-use-busy";
 
-    /** 一个工作区下是否有会话正在跑。 */
-    function workspaceIsBusy(workspaceRow) {
-      const section = workspaceRow.closest(".bhn1Oq_groupSection") || workspaceRow.parentElement;
-      if (section === null || section === undefined) return false;
-      const sessions = section.querySelectorAll(SESSION_ROW_SEL);
-      for (let i = 0; i < sessions.length; i += 1) {
-        if (sessions[i].querySelector('svg[data-state="ongoing"]') !== null) return true;
+    /** 折叠的工作区不渲染会话行，所以还要一份不依赖 DOM 的状态源。 */
+    function busyStateSources(ctx) {
+      const storeOf = (serviceName, field) => {
+        try {
+          let service;
+          try {
+            service = ctx.get(serviceName);
+          } catch (error) {
+            service = undefined;
+          }
+          if (service === undefined || service === null) service = ctx[serviceName];
+          if (service === undefined || service === null) return null;
+          const store = service[field];
+          if (store === undefined || store === null || typeof store.getSnapshot !== "function") return null;
+          return store;
+        } catch (error) {
+          return null;
+        }
+      };
+      return {
+        statuses: storeOf("uiSession", "sessionStatus"),
+        list: storeOf("sessions", "list"),
+        workspaces: storeOf("workspaces", "list")
+      };
+    }
+
+    /** 工作区 id 就在行 key 里：workspace:<id>。 */
+    function workspaceIdOf(workspaceRow) {
+      const key = workspaceRow.getAttribute("data-row-key");
+      if (typeof key !== "string" || key.indexOf("workspace:") !== 0) return "";
+      return key.slice("workspace:".length);
+    }
+
+    /** 状态源里该工作区是否有会话在跑；读不到时返回 null，由 DOM 结论兜底。 */
+    function workspaceBusyByState(sources, workspaceId) {
+      if (workspaceId === "" || sources.workspaces === null) return null;
+      let items;
+      try {
+        const snapshot = sources.workspaces.getSnapshot();
+        items = snapshot === undefined || snapshot === null || !Array.isArray(snapshot.items) ? null : snapshot.items;
+      } catch (error) {
+        return null;
+      }
+      if (items === null) return null;
+      let ids = null;
+      for (let i = 0; i < items.length; i += 1) {
+        const item = items[i];
+        if (item === null || typeof item !== "object" || item.workspaceId !== workspaceId) continue;
+        ids = Array.isArray(item.sessionIds) ? item.sessionIds : [];
+        break;
+      }
+      if (ids === null) return null;
+      let statuses = null;
+      try {
+        const snapshot = sources.statuses === null ? null : sources.statuses.getSnapshot();
+        statuses = snapshot !== null && typeof snapshot === "object" && typeof snapshot.get === "function" ? snapshot : null;
+      } catch (error) {
+        statuses = null;
+      }
+      let byId = null;
+      try {
+        const snapshot = sources.list === null ? null : sources.list.getSnapshot();
+        byId = snapshot !== null && typeof snapshot === "object" && snapshot.byId !== null && typeof snapshot.byId === "object" ? snapshot.byId : null;
+      } catch (error) {
+        byId = null;
+      }
+      for (let i = 0; i < ids.length; i += 1) {
+        const id = ids[i];
+        if (statuses !== null) {
+          const status = statuses.get(id);
+          if (status !== null && typeof status === "object" && status.running === true) return true;
+        }
+        if (byId !== null) {
+          const summary = byId[id];
+          if (summary !== null && typeof summary === "object" && summary.running === true) return true;
+        }
       }
       return false;
+    }
+
+    /** 一个工作区下是否有会话正在跑：展开时看渲染出来的会话行，收起时看状态源。 */
+    function workspaceIsBusy(workspaceRow, sources) {
+      const section = workspaceRow.closest(".bhn1Oq_groupSection") || workspaceRow.parentElement;
+      if (section !== null && section !== undefined) {
+        const sessions = section.querySelectorAll(SESSION_ROW_SEL);
+        if (sessions.length > 0) {
+          for (let i = 0; i < sessions.length; i += 1) {
+            if (sessions[i].querySelector('svg[data-state="ongoing"]') !== null) return true;
+          }
+          return false;
+        }
+      }
+      return workspaceBusyByState(sources, workspaceIdOf(workspaceRow)) === true;
     }
 
     /** 复刻官方 spinner 的结构与 class，动画由官方 CSS 驱动。 */
@@ -1055,33 +1139,47 @@ window.__ModuleLoader__.load({
     }
 
     /** 把工作区的文件夹图标换成转圈，或换回来。 */
-    function syncWorkspaceFolderIcon(workspaceRow) {
+    function syncWorkspaceFolderIcon(workspaceRow, sources) {
       const folder = workspaceRow.querySelector(".YDXeBa_folder");
       if (folder === null) return;
-      const busy = workspaceIsBusy(workspaceRow);
+      const busy = workspaceIsBusy(workspaceRow, sources);
       const existing = folder.querySelector("svg[" + BUSY_ICON_ATTR + "]");
-      const folderSvg = folder.querySelector("svg:not([" + BUSY_ICON_ATTR + "])");
+      // 官方图标节点会被 React 重建，内联隐藏必须每次同步重放，不能「已有转圈就返回」。
+      const icons = folder.querySelectorAll("svg:not([" + BUSY_ICON_ATTR + "])");
       if (busy === true) {
-        if (existing !== null) return;
-        if (folderSvg !== null) folderSvg.style.display = "none";
-        folder.appendChild(makeBusySpinner());
+        for (let i = 0; i < icons.length; i += 1) icons[i].style.display = "none";
+        if (existing === null) {
+          folder.appendChild(makeBusySpinner());
+        } else {
+          const duplicates = folder.querySelectorAll("svg[" + BUSY_ICON_ATTR + "]");
+          for (let i = 1; i < duplicates.length; i += 1) duplicates[i].remove();
+        }
         return;
       }
       if (existing !== null) existing.remove();
-      if (folderSvg !== null && folderSvg.style.display === "none") folderSvg.style.display = "";
+      for (let i = 0; i < icons.length; i += 1) {
+        if (icons[i].style.display === "none") icons[i].style.display = "";
+      }
     }
 
-    function syncAllWorkspaceIcons() {
+    function syncAllWorkspaceIcons(sources) {
       const rows = document.querySelectorAll(WORKSPACE_ROW_SEL);
-      for (let i = 0; i < rows.length; i += 1) syncWorkspaceFolderIcon(rows[i]);
+      for (let i = 0; i < rows.length; i += 1) syncWorkspaceFolderIcon(rows[i], sources);
     }
 
-    function installWorkspaceBusyIcons() {
+    function installWorkspaceBusyIcons(ctx) {
       let scheduled = false;
+      let sources = busyStateSources(ctx);
+      const subscribed = new Set();
+      const unsubscribes = [];
       const run = () => {
         scheduled = false;
         try {
-          syncAllWorkspaceIcons();
+          if (sources.statuses === null || sources.list === null || sources.workspaces === null) {
+            sources = busyStateSources(ctx);
+            subscribeStores();
+          }
+          syncAllWorkspaceIcons(sources);
         } catch (_) {}
       };
       const schedule = () => {
@@ -1089,6 +1187,20 @@ window.__ModuleLoader__.load({
         scheduled = true;
         window.setTimeout(run, 120);
       };
+      /** 收起时 DOM 不会变，只有状态源订阅能触发重绘。 */
+      function subscribeStores() {
+        const each = [sources.statuses, sources.list, sources.workspaces];
+        for (let i = 0; i < each.length; i += 1) {
+          const store = each[i];
+          if (store === null || store === undefined || typeof store.subscribe !== "function" || subscribed.has(store)) continue;
+          try {
+            const off = store.subscribe(schedule);
+            subscribed.add(store);
+            if (typeof off === "function") unsubscribes.push(off);
+          } catch (_) {}
+        }
+      }
+      subscribeStores();
       const observer = new MutationObserver(schedule);
       try {
         observer.observe(document.body, {
@@ -1101,6 +1213,13 @@ window.__ModuleLoader__.load({
       schedule();
       return () => {
         observer.disconnect();
+        for (let i = 0; i < unsubscribes.length; i += 1) {
+          try {
+            unsubscribes[i]();
+          } catch (_) {}
+        }
+        unsubscribes.length = 0;
+        subscribed.clear();
       };
     }
     // #endregion
@@ -1789,7 +1908,9 @@ window.__ModuleLoader__.load({
       ".dsh-self-use-details { margin-top: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #71717a); }",
       ".dsh-self-use-details summary { cursor: pointer; }",
       ".dsh-self-use-minutes { width: 88px; box-sizing: border-box; padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.25)); border-radius: var(--dsw-radius-md, 8px); background: var(--dsw-alias-bg-layer-1, #ffffff); color: inherit; font: inherit; font-size: 13px; line-height: 18px; }",
-      ".dsh-self-use-minutes:disabled { cursor: not-allowed; opacity: 0.45; }"
+      ".dsh-self-use-minutes:disabled { cursor: not-allowed; opacity: 0.45; }",
+      "/* 工作区忙碌时只留转圈：官方图标节点会被 React 重建，内联隐藏会丢，用 :has 兜底。 */",
+      ".YDXeBa_folder:has(svg[data-dsh-self-use-busy]) > svg:not([data-dsh-self-use-busy]) { display: none !important; }"
     ];
     const CSS_TEXT = CSS_LINES.join("\n");
     // #endregion
@@ -4218,7 +4339,7 @@ window.__ModuleLoader__.load({
     // 访问会抛 cannot get property "remote.skills" without inject。官方 ui-skill / ui-reference
     // 同样显式声明 remote.skills、remote.fileReferences 等子命名空间。
     let pluginContext = null;
-    const inject = ["slots", "sessions", "remote", "remote.session", "remote.settings", "remote.skills", "inputTriggers"];
+    const inject = ["slots", "sessions", "workspaces", "uiSession", "remote", "remote.session", "remote.settings", "remote.skills", "inputTriggers"];
 
     function apply(ctx) {
       pluginContext = ctx;
@@ -4273,7 +4394,7 @@ window.__ModuleLoader__.load({
 
       ctx.effect(() => mountStickyPrompt(), "dsh-self-use: sticky prompt");
       ctx.effect(() => installPromptHistory(), "dsh-self-use: prompt history");
-      ctx.effect(() => installWorkspaceBusyIcons(), "dsh-self-use: workspace busy icons");
+      ctx.effect(() => installWorkspaceBusyIcons(ctx), "dsh-self-use: workspace busy icons");
       ctx.effect(() => installQuestionActivityWatch(), "dsh-self-use: question activity watch");
       ctx.effect(() => installModelEyeButtons(), "dsh-self-use: model eye buttons");
       wrapModelCatalogForCustom(ctx);
