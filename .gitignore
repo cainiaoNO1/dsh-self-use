@@ -29,3 +29,7 @@ yarn-error.log*
 coverage/
 .tmp/
 tmp/
+
+# GitHub Token & Local Env
+.github_token
+.token
