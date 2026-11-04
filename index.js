@@ -917,18 +917,56 @@ async function skillLookupOptions(ctx, agent, signal) {
  * Assembly sections carry no `order` field, so the array index is the only lever:
  * appending puts the skill rules last, where a fast model ignores them.
  */
+export const PERSONA_SECTION_NAMES = ['deployment:persona-prefix', 'deployment:persona', 'persona'];
+const AUTO_SKILL_SECTION_NAME = 'dsh-self-use:auto-skills';
+const SKILL_MARKER_START = '\n\n<!-- dsh-self-use:auto-skills:start -->\n';
+const SKILL_MARKER_END = '\n<!-- dsh-self-use:auto-skills:end -->';
+const SKILL_MARKER_REGEX = /\n\n<!-- dsh-self-use:auto-skills:start -->[\s\S]*?<!-- dsh-self-use:auto-skills:end -->/;
+
 function insertAfterIdentity(sections, section) {
   const index = sections.findIndex((entry) => entry && entry.name === 'harness:identity');
   if (index < 0) return [...sections, section];
   return [...sections.slice(0, index + 1), section, ...sections.slice(index + 1)];
 }
 
-/** The single prompt section every auto-attached skill lands in. */
-const AUTO_SKILL_SECTION_NAME = 'dsh-self-use:auto-skills';
-
 /** Whether one assembly section is ours, so a later step can replace it. */
 function isSkillSection(section) {
   return Boolean(section) && typeof section === 'object' && section.name === AUTO_SKILL_SECTION_NAME;
+}
+
+/** Fuse auto-skills directly into the persona section so they survive minimal-prompt filters. */
+export function injectIntoSections(sections, blocks) {
+  const result = sections.filter((s) => !isSkillSection(s));
+
+  const personaIndex = result.findIndex(
+    (s) => s && typeof s === 'object' && PERSONA_SECTION_NAMES.includes(s.name) && typeof s.text === 'string'
+  );
+
+  if (personaIndex >= 0) {
+    const persona = result[personaIndex];
+    const cleanText = persona.text.replace(SKILL_MARKER_REGEX, '');
+    if (blocks.length > 0) {
+      const injectedText = cleanText + SKILL_MARKER_START + blocks.join('\n\n') + SKILL_MARKER_END;
+      result[personaIndex] = {
+        ...persona,
+        text: injectedText,
+        interpolate: false
+      };
+    } else {
+      result[personaIndex] = {
+        ...persona,
+        text: cleanText
+      };
+    }
+    return result;
+  }
+
+  if (blocks.length > 0) {
+    const section = { name: AUTO_SKILL_SECTION_NAME, text: blocks.join('\n\n'), interpolate: false };
+    return insertAfterIdentity(result, section);
+  }
+
+  return result;
 }
 
 /**
@@ -997,17 +1035,11 @@ export function installAutoSkillInjection(ctx, options = {}) {
       const scope = context && typeof context === 'object' ? context : {};
       const trace = await buildSkillBlocks(ctx, homeDir, scope.agent, scope.signal);
       const blocks = trace.blocks;
-      if (blocks.length === 0) {
-        traceDiag(homeDir, trace);
-        return base;
-      }
-      // 同名 section 先移除再写入，避免每步累加导致 prompt 膨胀。
-      const kept = base.sections.filter((section) => !isSkillSection(section));
-      const section = { name: AUTO_SKILL_SECTION_NAME, text: blocks.join('\n\n'), interpolate: false };
-      const sections = insertAfterIdentity(kept, section);
+      const sections = injectIntoSections(base.sections, blocks);
       const result = { ...base, sections };
       trace.diag.returned = result.sections.length;
       trace.diag.sectionNames = result.sections.map((section) => section.name);
+      trace.diag.injectedIntoPersona = sections.some((s) => s && PERSONA_SECTION_NAMES.includes(s.name) && typeof s.text === 'string' && s.text.includes(SKILL_MARKER_START));
       traceDiag(homeDir, trace);
       return result;
     } catch (_) {
@@ -1016,7 +1048,7 @@ export function installAutoSkillInjection(ctx, options = {}) {
     }
   };
 
-  const dispose = ctx.on('system-prompt/assemble', listener);
+  const dispose = ctx.on('system-prompt/assemble', listener, { prepend: true });
   const cleanup = typeof dispose === 'function' ? dispose : () => {};
   if (typeof ctx.effect === 'function') ctx.effect(() => cleanup, 'dsh-self-use: auto-skill prompt section');
   return cleanup;
